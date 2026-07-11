@@ -134,7 +134,9 @@ class CableNeckNode(Node):
                 + " ".join(f"[C{n['connector']} @({n['neck'][0]:.0f},{n['neck'][1]:.0f}) "
                            f"{n['angle_deg']:+.0f}deg]" for n in necks))
         except Exception as e:  # noqa: BLE001 - keep the node alive on bad frames
-            self.get_logger().error(f"detection failed: {e}")
+            import traceback
+            self.get_logger().error(
+                f"detection failed: {type(e).__name__}: {e}\n{traceback.format_exc()}")
         finally:
             self._busy = False
 
