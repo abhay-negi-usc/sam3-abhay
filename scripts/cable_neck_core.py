@@ -223,15 +223,23 @@ class NeckDetector:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         model = build_sam3_image_model()
-        self.processor = Sam3Processor(model, confidence_threshold=threshold)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Half precision to fit a small (~6 GB) GPU: fp16 weights ~halve the model's VRAM. autocast
+        # (in detect) normalizes per-op dtypes so mixed fp16/fp32 ops still work. NOTE: on Pascal
+        # (GTX 10xx) fp16 compute has no hardware acceleration -> slower inference; raise the scan
+        # dwell time to suit. On CPU the model stays fp32.
+        if self.device == "cuda":
+            model = model.half()
+        self.processor = Sam3Processor(model, confidence_threshold=threshold)
 
     def detect(self, pil_rgb):
         """Run SAM3 + geometry on a PIL RGB image. Returns the compute_necks dict
         plus the raw cable/connector counts."""
         torch = self._torch
         W, H = pil_rgb.size
-        autocast = torch.autocast(self.device, dtype=torch.bfloat16)
+        # float16 on CUDA (matches the half() weights; Pascal has no bf16 units), bfloat16 on CPU.
+        ac_dtype = torch.float16 if self.device == "cuda" else torch.bfloat16
+        autocast = torch.autocast(self.device, dtype=ac_dtype)
         with torch.inference_mode(), autocast:
             state = self.processor.set_image(pil_rgb)
             self.processor.reset_all_prompts(state)
