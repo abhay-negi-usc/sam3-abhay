@@ -12,6 +12,7 @@ Neck convention (image/pixel coordinates):
   * angle_deg = atan2(-dy, dx): 0deg = +u (right), +90deg = up.
 """
 import math
+import os
 
 import cv2
 import numpy as np
@@ -224,22 +225,21 @@ class NeckDetector:
         torch.backends.cudnn.allow_tf32 = True
         model = build_sam3_image_model()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Half precision to fit a small (~6 GB) GPU: fp16 weights ~halve the model's VRAM. autocast
-        # (in detect) normalizes per-op dtypes so mixed fp16/fp32 ops still work. NOTE: on Pascal
-        # (GTX 10xx) fp16 compute has no hardware acceleration -> slower inference; raise the scan
-        # dwell time to suit. On CPU the model stays fp32.
-        if self.device == "cuda":
-            model = model.half()
-        self.processor = Sam3Processor(model, confidence_threshold=threshold)
+        # Reduce the inference resolution to fit a small (~6 GB) GPU: activation memory scales with
+        # resolution^2, so lowering it from the default 1008 is the cheapest way to cut peak VRAM.
+        # Stays fp32 (no fp16/fp32 dtype juggling, and fp32 is actually FASTER than fp16 on Pascal
+        # GPUs). Lower this further (704 / 640 / 512) if you still OOM; raise it if thin cables get
+        # missed. Kept configurable via the SAM3_RESOLUTION env var for quick tuning without editing.
+        resolution = int(os.environ.get("SAM3_RESOLUTION", "768"))
+        self.processor = Sam3Processor(model, resolution=resolution,
+                                       confidence_threshold=threshold)
 
     def detect(self, pil_rgb):
         """Run SAM3 + geometry on a PIL RGB image. Returns the compute_necks dict
         plus the raw cable/connector counts."""
         torch = self._torch
         W, H = pil_rgb.size
-        # float16 on CUDA (matches the half() weights; Pascal has no bf16 units), bfloat16 on CPU.
-        ac_dtype = torch.float16 if self.device == "cuda" else torch.bfloat16
-        autocast = torch.autocast(self.device, dtype=ac_dtype)
+        autocast = torch.autocast(self.device, dtype=torch.bfloat16)
         with torch.inference_mode(), autocast:
             state = self.processor.set_image(pil_rgb)
             self.processor.reset_all_prompts(state)
