@@ -223,6 +223,17 @@ class NeckDetector:
         self.mislabel_overlap = mislabel_overlap
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        # SDPA backend -- this is what makes SAM3 fit on a small, pre-Ampere GPU.
+        # SAM3's get_sdpa_settings() disables Flash Attention on any GPU below Ampere and falls back
+        # to the MATH kernel, which MATERIALIZES the full NxN attention matrix (~822 MB at 1008px)
+        # and OOMs a 6 GB card. The cutlass MEMORY-EFFICIENT backend runs on Pascal and never
+        # materializes it. It is only eligible for fp16 (bf16 needs sm_80), which is why detect()
+        # autocasts to float16 on CUDA. Weights stay fp32 -- autocast casts per op, so there is no
+        # fp16/fp32 mismatch (unlike .half()'ing the model, which SAM3 does not support).
+        if torch.cuda.is_available():
+            torch.backends.cuda.enable_flash_sdp(False)         # needs Ampere; unavailable here
+            torch.backends.cuda.enable_mem_efficient_sdp(True)  # the one that saves the memory
+            torch.backends.cuda.enable_math_sdp(True)           # keep only as a last-resort fallback
         model = build_sam3_image_model()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         # Do NOT .half() this model. SAM3 creates fp32 tensors internally all over its graph (decoder
@@ -241,7 +252,11 @@ class NeckDetector:
         plus the raw cable/connector counts."""
         torch = self._torch
         W, H = pil_rgb.size
-        autocast = torch.autocast(self.device, dtype=torch.bfloat16)
+        # float16 on CUDA: REQUIRED for the memory-efficient SDPA backend on a pre-Ampere GPU (bf16
+        # needs sm_80; without fp16 the attention silently falls back to the math kernel, which
+        # materializes the full NxN matrix and OOMs). bfloat16 on CPU.
+        ac_dtype = torch.float16 if self.device == "cuda" else torch.bfloat16
+        autocast = torch.autocast(self.device, dtype=ac_dtype)
         with torch.inference_mode(), autocast:
             state = self.processor.set_image(pil_rgb)
             self.processor.reset_all_prompts(state)
