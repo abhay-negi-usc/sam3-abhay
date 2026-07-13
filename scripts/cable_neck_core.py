@@ -225,14 +225,13 @@ class NeckDetector:
         torch.backends.cudnn.allow_tf32 = True
         model = build_sam3_image_model()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Fit a small (~6 GB) GPU with fp16 WEIGHTS (~halves the model's VRAM). Sam3Processor.set_image
-        # casts the input to the model's dtype, so fp16 weights and fp16 activations stay consistent
-        # (its transform otherwise always emits float32 -> "mat1 and mat2 ... Float and Half").
-        # NOTE: the RESOLUTION MUST STAY 1008 -- the ViTDet backbone's RoPE `freqs_cis` is a buffer
-        # baked for the native 1008 grid, so any other resolution trips the assert in
-        # vitdet.reshape_for_broadcast. The env var exists only for experimentation.
-        if self.device == "cuda":
-            model = model.half()
+        # Do NOT .half() this model. SAM3 creates fp32 tensors internally all over its graph (decoder
+        # queries, text embeddings, ...), and autocast doesn't cover those paths -- fp16 weights then
+        # collide with them ("mat1 and mat2 must have the same dtype, but got Float and Half") in one
+        # op after another. Keep fp32 weights + autocast (see detect); to fit a small GPU, free other
+        # VRAM (close GPU-accelerated apps) rather than changing the model's precision.
+        # RESOLUTION MUST STAY 1008: the ViTDet backbone's RoPE `freqs_cis` buffer is baked for that
+        # grid, so any other value trips the assert in vitdet.reshape_for_broadcast.
         resolution = int(os.environ.get("SAM3_RESOLUTION", "1008"))
         self.processor = Sam3Processor(model, resolution=resolution,
                                        confidence_threshold=threshold)
@@ -242,9 +241,7 @@ class NeckDetector:
         plus the raw cable/connector counts."""
         torch = self._torch
         W, H = pil_rgb.size
-        # float16 on CUDA to match the half() weights (Pascal has no bf16 units); bfloat16 on CPU.
-        ac_dtype = torch.float16 if self.device == "cuda" else torch.bfloat16
-        autocast = torch.autocast(self.device, dtype=ac_dtype)
+        autocast = torch.autocast(self.device, dtype=torch.bfloat16)
         with torch.inference_mode(), autocast:
             state = self.processor.set_image(pil_rgb)
             self.processor.reset_all_prompts(state)
