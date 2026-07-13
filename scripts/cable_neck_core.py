@@ -212,7 +212,7 @@ class NeckDetector:
     """SAM3-backed cable-neck detector. Loads the model once; reuse across frames."""
 
     def __init__(self, cable_prompt="cable", connector_prompt="connector",
-                 threshold=0.5, mislabel_overlap=0.6):
+                 threshold=0.5, connector_threshold=None, mislabel_overlap=0.6):
         import torch
         from sam3 import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
@@ -221,6 +221,14 @@ class NeckDetector:
         self.cable_prompt = cable_prompt
         self.connector_prompt = connector_prompt
         self.mislabel_overlap = mislabel_overlap
+        # SEPARATE thresholds per prompt. The connector is the harder class: it is small, and SAM3
+        # happily labels the whole assembly "cable", which leaves conn_masks EMPTY -- and since
+        # compute_necks iterates over CONNECTORS, that yields ZERO necks no matter how good the cable
+        # mask is. A lower threshold for the connector alone lets marginal detections through WITHOUT
+        # flooding the cable side with spurious masks; one shared threshold cannot do both.
+        self.cable_threshold = float(threshold)
+        self.connector_threshold = (float(threshold) if connector_threshold is None
+                                    else float(connector_threshold))
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         # SDPA backend -- this is what makes SAM3 fit on a small, pre-Ampere GPU.
@@ -260,9 +268,12 @@ class NeckDetector:
         with torch.inference_mode(), autocast:
             state = self.processor.set_image(pil_rgb)
             self.processor.reset_all_prompts(state)
+            self.processor.set_confidence_threshold(self.cable_threshold)
             cable_masks = masks_from_output(
                 self.processor.set_text_prompt(state=state, prompt=self.cable_prompt))
             self.processor.reset_all_prompts(state)
+            # Lower bar for the connector -- see __init__: no connector mask means no neck at all.
+            self.processor.set_confidence_threshold(self.connector_threshold)
             conn_masks_raw = masks_from_output(
                 self.processor.set_text_prompt(state=state, prompt=self.connector_prompt))
         result = compute_necks(cable_masks, conn_masks_raw, H, W, self.mislabel_overlap)

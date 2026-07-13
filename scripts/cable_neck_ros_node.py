@@ -80,6 +80,11 @@ class CableNeckNode(Node):
         cable_prompt = p("cable_prompt", "cable").value
         connector_prompt = p("connector_prompt", "connector").value
         threshold = p("threshold", 0.5).value
+        # Separate, usually LOWER bar for the connector. It is the harder class -- SAM3 tends to label
+        # the whole assembly "cable", leaving no connector mask, and compute_necks iterates over
+        # CONNECTORS, so zero connector masks => zero necks regardless of the cable. -1 = use `threshold`.
+        connector_threshold = p("connector_threshold", -1.0).value
+        connector_threshold = None if connector_threshold < 0 else connector_threshold
         mislabel_overlap = p("mislabel_overlap", 0.6).value
         self.publish_debug = p("publish_debug", True).value
 
@@ -87,8 +92,12 @@ class CableNeckNode(Node):
         self.detector = NeckDetector(cable_prompt=cable_prompt,
                                      connector_prompt=connector_prompt,
                                      threshold=threshold,
+                                     connector_threshold=connector_threshold,
                                      mislabel_overlap=mislabel_overlap)
-        self.get_logger().info(f"Model ready on {self.detector.device}.")
+        self.get_logger().info(
+            f"Model ready on {self.detector.device}. "
+            f"prompts: cable='{cable_prompt}' (thr {self.detector.cable_threshold:.2f}), "
+            f"connector='{connector_prompt}' (thr {self.detector.connector_threshold:.2f}).")
 
         # keep only the latest frame; SAM3 inference is ~1-2 s/frame
         sub_qos = QoSProfile(history=QoSHistoryPolicy.KEEP_LAST, depth=1,
@@ -129,8 +138,14 @@ class CableNeckNode(Node):
                 vis = render_overlay(bgr, res["cleaned_cables"], res["conn_masks"], necks)
                 self.pub_debug.publish(rgb_to_imgmsg(vis, msg.header, "bgr8"))
 
+            # Report the RAW per-prompt mask counts, not just the necks. Without these, a total
+            # failure is indistinguishable from a near miss: `connectors=0` means the connector prompt
+            # found nothing, so compute_necks (which loops over connectors) can never emit a neck --
+            # lower `connector_threshold` or reword `connector_prompt`. `dropped` counts cable masks
+            # thrown away as mislabelled connectors (mislabel_overlap).
             self.get_logger().info(
-                f"necks={len(necks)} "
+                f"necks={len(necks)} | raw: cables={res['cables_raw']} "
+                f"connectors={res['connectors_raw']} dropped={res.get('n_dropped', 0)} "
                 + " ".join(f"[C{n['connector']} @({n['neck'][0]:.0f},{n['neck'][1]:.0f}) "
                            f"{n['angle_deg']:+.0f}deg]" for n in necks))
         except Exception as e:  # noqa: BLE001 - keep the node alive on bad frames
