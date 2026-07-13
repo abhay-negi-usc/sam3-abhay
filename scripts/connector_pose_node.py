@@ -5,8 +5,15 @@ connector.
 
 Connector pose convention (output):
   * origin = the neck 3D point where the cable and connector interface.
-  * z axis = along the connector axis (direction it points, away from the cable).
-  * x, y axes = arbitrary (a stable frame completed from z).
+  * x axis = along the connector AXIS (the direction it points, away from the cable).
+  * z axis = `up_axis` (a world-frame direction, default +Z), re-orthogonalized perpendicular to x.
+    This is the "the connector's z is coincident with the world z" assumption -- it pins down the
+    roll about the axis, which the measurement itself cannot determine.
+  * y axis = z x x  (completes a right-handed frame; horizontal).
+
+  EVERY axis is meaningful, so the published TF can be read directly in RViz / tf2_echo. (This node
+  used to put the axis in Z with ARBITRARY x/y, which looked wrong on inspection and forced every
+  consumer to rebuild the frame themselves.)
 
 Method (multi-view fusion; single connector):
   For every neck message we look up the camera pose from TF at the image stamp and
@@ -14,7 +21,7 @@ Method (multi-view fusion; single connector):
   With >= min_views and enough parallax we compute:
     * origin P  : least-squares triangulation of the 3D point closest to all the
                   back-projected neck rays. Metric because the camera poses are metric.
-    * z axis a  : the connector axis is a 3D line; each view's image line (through p
+    * axis a    : the connector axis is a 3D line; each view's image line (through p
                   along d) back-projects to a plane with world normal n_k, and the
                   axis is orthogonal to every n_k. a = smallest singular vector of
                   the stacked n_k (SVD). Sign resolved to match the observed 2D arrow.
@@ -88,12 +95,28 @@ def rotmat_to_quat(R):
     return x, y, z, w
 
 
-def frame_from_z(a):
-    """Return a 3x3 rotation whose 3rd column is unit vector a (z), x/y arbitrary."""
-    z = a / (np.linalg.norm(a) + 1e-12)
-    ref = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
-    x = np.cross(ref, z); x /= (np.linalg.norm(x) + 1e-12)
-    y = np.cross(z, x)
+def frame_from_axis(a, up):
+    """Connector frame as a 3x3 rotation (columns = x, y, z), in world coordinates.
+
+    x = the connector AXIS `a` (the one rotational DOF the multi-view fusion actually measures),
+    z = `up` re-orthogonalized perpendicular to x  (the assumption that pins down roll about the
+        axis, which the measurement cannot determine),
+    y = z x x.
+
+    Unlike an arbitrary completion of the axis, every column here means something, so the resulting
+    TF is directly interpretable.
+    """
+    x = np.asarray(a, dtype=float)
+    x = x / (np.linalg.norm(x) + 1e-12)
+    u = np.asarray(up, dtype=float)
+    u = u / (np.linalg.norm(u) + 1e-12)
+    y = np.cross(u, x)
+    if np.linalg.norm(y) < 1e-6:          # axis is ~parallel to `up`: fall back to another reference
+        alt = np.array([1.0, 0.0, 0.0]) if abs(x[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        y = np.cross(alt, x)
+    y /= (np.linalg.norm(y) + 1e-12)
+    z = np.cross(x, y)
+    z /= (np.linalg.norm(z) + 1e-12)
     return np.column_stack([x, y, z])
 
 
@@ -110,6 +133,10 @@ class ConnectorPoseNode(Node):
         self.max_history = int(p("max_history", 60).value)
         self.min_views = int(p("min_views", 2).value)
         self.min_parallax_deg = float(p("min_parallax_deg", 3.0).value)
+        # The published connector frame's z is aligned to this world-frame direction (re-orthogonalized
+        # perpendicular to the measured axis). It fixes the roll about the axis, which the fusion
+        # cannot measure. Default +Z = the "connector z is coincident with the base z" assumption.
+        self.up_axis = [float(v) for v in p("up_axis", [0.0, 0.0, 1.0]).value]
         self.tf_timeout = float(p("tf_timeout", 0.2).value)
         # TF history to keep. Necks are stamped with the IMAGE time, and SAM3 inference can take
         # seconds, so by the time a neck arrives its stamp is already seconds old. The tf2 default
@@ -232,7 +259,7 @@ class ConnectorPoseNode(Node):
             self.get_logger().warn("degenerate triangulation.", throttle_duration_sec=2.0)
             return
 
-        # --- z axis: null space of the stacked image-line-plane normals ---
+        # --- connector axis: null space of the stacked image-line-plane normals ---
         N = np.array(normals)
         _, _, Vt = np.linalg.svd(N)
         a = Vt[-1]
@@ -257,11 +284,22 @@ class ConnectorPoseNode(Node):
         depth = float(Xc[2])
         exp_r = (self.K[0, 0] * (self.neck_diameter / 2.0) / depth) if depth > 1e-6 else float("nan")
 
-        R = frame_from_z(a)
+        # Build the CONNECTOR frame: x = the measured axis, z = up_axis, y = z x x. Every axis is
+        # meaningful, so consumers (and RViz) can use this TF directly -- no rebuilding needed.
+        R = frame_from_axis(a, self.up_axis)
         qx, qy, qz, qw = rotmat_to_quat(R)
 
+        # Stamp the OUTPUT with NOW -- not with the image time.
+        # The connector is a STATIC object pose in world_frame: this is our current best estimate of
+        # where the cable IS, not a claim about where it was. Stamping it with the (seconds-old) image
+        # time forces every consumer into a time-travel lookup and trips "Lookup would require
+        # extrapolation into the past" as soon as the detector is slow -- it makes the frame unusable
+        # in tf2_echo, RViz and the demo alike. The image stamp is still used INTERNALLY (above) to
+        # fetch the camera pose at CAPTURE time, which is the part that must be time-accurate.
+        now = self.get_clock().now().to_msg()
+
         ps = PoseStamped()
-        ps.header.stamp = stamp
+        ps.header.stamp = now
         ps.header.frame_id = self.world_frame
         ps.pose.position.x, ps.pose.position.y, ps.pose.position.z = map(float, P)
         ps.pose.orientation.x, ps.pose.orientation.y = qx, qy
@@ -269,7 +307,7 @@ class ConnectorPoseNode(Node):
         self.pub_pose.publish(ps)
 
         tfm = TransformStamped()
-        tfm.header.stamp = stamp
+        tfm.header.stamp = now
         tfm.header.frame_id = self.world_frame
         tfm.child_frame_id = self.connector_frame
         tfm.transform.translation.x, tfm.transform.translation.y, tfm.transform.translation.z = map(float, P)
@@ -279,7 +317,7 @@ class ConnectorPoseNode(Node):
 
         self.get_logger().info(
             f"connector pose | P=({P[0]:.3f},{P[1]:.3f},{P[2]:.3f}) "
-            f"z=({a[0]:+.2f},{a[1]:+.2f},{a[2]:+.2f}) views={len(self.history)} "
+            f"axis=({a[0]:+.2f},{a[1]:+.2f},{a[2]:+.2f}) views={len(self.history)} "
             f"parallax={max_ang:.1f}deg depth={depth:.2f}m exp_neck_r={exp_r:.1f}px")
 
 
