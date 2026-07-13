@@ -48,6 +48,7 @@ from geometry_msgs.msg import PoseArray, PoseStamped, TransformStamped
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo
 from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 
@@ -110,13 +111,18 @@ class ConnectorPoseNode(Node):
         self.min_views = int(p("min_views", 2).value)
         self.min_parallax_deg = float(p("min_parallax_deg", 3.0).value)
         self.tf_timeout = float(p("tf_timeout", 0.2).value)
+        # TF history to keep. Necks are stamped with the IMAGE time, and SAM3 inference can take
+        # seconds, so by the time a neck arrives its stamp is already seconds old. The tf2 default
+        # cache is only 10 s, which makes that lookup fail with "extrapolation into the past".
+        # Keep well more history than the worst-case detector latency.
+        self.tf_cache_s = float(p("tf_cache_s", 60.0).value)
 
         self.K = None
         self.Kinv = None
         self.history = deque(maxlen=self.max_history)   # dicts: p,d,C,R_wc
         self.last_pixel = None
 
-        self.tf_buffer = Buffer()
+        self.tf_buffer = Buffer(cache_time=Duration(seconds=self.tf_cache_s))
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
 
@@ -126,7 +132,7 @@ class ConnectorPoseNode(Node):
         self.get_logger().info(
             f"Waiting for CameraInfo on '{self.camera_info_topic}' and necks on "
             f"'{self.necks_topic}'. world='{self.world_frame}', neck_diameter="
-            f"{self.neck_diameter} m.")
+            f"{self.neck_diameter} m, tf_cache={self.tf_cache_s}s, tf_timeout={self.tf_timeout}s.")
 
     # ---------------------------------------------------------------- callbacks
     def on_caminfo(self, msg: CameraInfo):
@@ -163,8 +169,12 @@ class ConnectorPoseNode(Node):
                 self.world_frame, src, msg.header.stamp,
                 timeout=Duration(seconds=self.tf_timeout))
         except Exception as e:  # noqa: BLE001
-            self.get_logger().warn(f"TF {self.world_frame}<-{src} unavailable: {e}",
-                                   throttle_duration_sec=2.0)
+            # Report HOW STALE the neck is: it carries the IMAGE stamp, so it lags by the detector's
+            # inference time. If age > tf_cache the lookup falls off the back of the buffer.
+            age = (self.get_clock().now() - Time.from_msg(msg.header.stamp)).nanoseconds / 1e9
+            self.get_logger().warn(
+                f"TF {self.world_frame}<-{src} unavailable (neck stamp is {age:.1f}s old; "
+                f"tf_cache={self.tf_cache_s}s): {e}", throttle_duration_sec=2.0)
             return
 
         t = tf.transform.translation
