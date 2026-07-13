@@ -53,6 +53,10 @@ class Sam3Processor:
 
         image = v2.functional.to_image(image).to(self.device)
         image = self.transform(image).unsqueeze(0)
+        # Match the model's dtype. The transform above always emits float32, which breaks a model
+        # that was .half()'d to fit a small GPU (fp32 activation x fp16 weight -> "mat1 and mat2
+        # must have the same dtype, but got Float and Half"). No-op for a normal fp32 model.
+        image = image.to(next(self.model.parameters()).dtype)
 
         state["original_height"] = height
         state["original_width"] = width
