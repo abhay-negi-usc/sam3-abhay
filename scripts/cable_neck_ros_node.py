@@ -88,6 +88,16 @@ class CableNeckNode(Node):
         mislabel_overlap = p("mislabel_overlap", 0.6).value
         self.publish_debug = p("publish_debug", True).value
 
+        # ADAPTIVE THRESHOLD (recommended). Rather than committing to one threshold, run SAM3 once at
+        # `confidence_floor` and then search the threshold PAIR per image, keeping the MOST CONFIDENT
+        # masks that still yield a valid neck -- i.e. a cable and connector that actually TOUCH. This
+        # is the direct answer to SAM3 flip-flopping between labelling the connector "cable" and vice
+        # versa: whichever class comes up empty at a fixed threshold kills the neck, because a neck IS
+        # the cable/connector contact. Costs no extra inference -- the threshold is only a filter on
+        # per-mask scores, so the forward pass is identical. See NeckDetector.detect_adaptive.
+        self.adaptive = bool(p("adaptive", True).value)
+        self.confidence_floor = float(p("confidence_floor", 0.05).value)
+
         self.get_logger().info("Loading SAM3 model (first run downloads the checkpoint)...")
         self.detector = NeckDetector(cable_prompt=cable_prompt,
                                      connector_prompt=connector_prompt,
@@ -116,7 +126,9 @@ class CableNeckNode(Node):
         self._busy = True
         try:
             rgb = imgmsg_to_rgb(msg)
-            res = self.detector.detect(PILImage.fromarray(rgb))
+            res = (self.detector.detect_adaptive(PILImage.fromarray(rgb),
+                                                 floor=self.confidence_floor)
+                   if self.adaptive else self.detector.detect(PILImage.fromarray(rgb)))
             necks = res["necks"]
 
             pa = PoseArray()
@@ -143,9 +155,21 @@ class CableNeckNode(Node):
             # found nothing, so compute_necks (which loops over connectors) can never emit a neck --
             # lower `connector_threshold` or reword `connector_prompt`. `dropped` counts cable masks
             # thrown away as mislabelled connectors (mislabel_overlap).
+            # In adaptive mode, report the thresholds the SEARCH actually chose for this frame -- that
+            # is the diagnostic. `thr=-` means no admissible threshold pair produced a cable/connector
+            # contact, i.e. lowering `confidence_floor` (or rewording a prompt) is what's needed.
+            if self.adaptive:
+                if res.get("eff_conf") is not None:
+                    thr = (f"thr: cable={res['thr_cable']:.2f} conn={res['thr_conn']:.2f} "
+                           f"(eff {res['eff_conf']:.2f}, {res.get('combos_tried', 0)} combos)")
+                else:
+                    thr = (f"thr=- (no admissible pair gave a neck; {res.get('combos_tried', 0)} "
+                           f"combos tried above floor {self.confidence_floor:.2f})")
+            else:
+                thr = "thr=fixed"
             self.get_logger().info(
                 f"necks={len(necks)} | raw: cables={res['cables_raw']} "
-                f"connectors={res['connectors_raw']} dropped={res.get('n_dropped', 0)} "
+                f"connectors={res['connectors_raw']} dropped={res.get('n_dropped', 0)} | {thr} "
                 + " ".join(f"[C{n['connector']} @({n['neck'][0]:.0f},{n['neck'][1]:.0f}) "
                            f"{n['angle_deg']:+.0f}deg]" for n in necks))
         except Exception as e:  # noqa: BLE001 - keep the node alive on bad frames
