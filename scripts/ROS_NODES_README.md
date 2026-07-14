@@ -65,10 +65,31 @@ source /opt/ros/jazzy/setup.bash
 
 Run:
 ```bash
-source /opt/ros/jazzy/setup.bash            # (+ conda activate sam3_ros for Option B)
-python scripts/cable_neck_ros_node.py --ros-args \
-  -p image_topic:=/camera/color/image_raw -p publish_debug:=true
+source /opt/sam3_venv/bin/activate && source /opt/ros/jazzy/setup.bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python3 scripts/cable_neck_ros_node.py --ros-args \
+  -p image_topic:=/camera/camera1/color/image_raw -p publish_debug:=true \
+  -p adaptive:=true -p confidence_floor:=0.2
 ```
+
+> **`adaptive:=true` is the important flag.** With a fixed threshold SAM3 flips between labelling the
+> connector "cable" and the cable "connector"; whichever class comes up empty kills the neck outright,
+> because `compute_necks` iterates over CONNECTOR masks — a neck **is** the cable/connector contact.
+> Adaptive mode runs SAM3 **once** at `confidence_floor`, then searches the threshold *pair* in
+> software, keeping the most confident masks that still yield a valid neck. It costs **no extra
+> inference**: the threshold is only a filter on per‑mask scores (`keep = out_probs > threshold`), so
+> the forward pass is identical. The log reports what it chose per frame:
+> ```
+> necks=1 | raw: cables=3 connectors=2 dropped=1 | thr: cable=0.91 conn=0.18 (eff 0.18, 1 combos)
+> necks=0 | raw: cables=3 connectors=0 dropped=0 | thr=- (no admissible pair gave a neck)
+> ```
+> The second line means **no connector mask at all, even at the floor** — lower `confidence_floor` or
+> reword `connector_prompt`. (If SAM3 *never* produces a connector mask, use `cable_tip_ros_node.py`
+> instead: it unions the masks and works on shape, so it cannot be starved.)
+
+> **Note on the topic name:** realsense2_camera nests topics under *camera_namespace* **and**
+> *camera_name*, so with `camera_name:=camera1` the image is on `/camera/camera1/color/image_raw` —
+> **not** `/camera1/...`. The image **frame** is still `camera1_color_optical_frame`.
 
 ## Node 2 — `connector_pose_node.py`
 
@@ -96,7 +117,8 @@ broadcast `world_frame → connector_frame`.
 Node 2 depends only on numpy + rclpy + tf2_ros (no torch), so it runs in a plain rclpy env:
 ```bash
 source /opt/ros/jazzy/setup.bash
-python scripts/connector_pose_node.py --ros-args -p neck_diameter:=0.018 -p world_frame:=base_link
+python3 scripts/connector_pose_node.py --ros-args -p neck_diameter:=0.018 -p world_frame:=base_link \
+  -p camera_info_topic:=/camera/camera1/color/camera_info -p tf_cache_s:=60.0
 ```
 
 ## Notes
