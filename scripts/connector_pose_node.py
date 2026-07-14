@@ -95,6 +95,26 @@ def rotmat_to_quat(R):
     return x, y, z, w
 
 
+def ray_point_distance(C, g, P):
+    """Perpendicular distance from point P to the ray (origin C, unit direction g)."""
+    w = np.asarray(P, dtype=float) - np.asarray(C, dtype=float)
+    return float(np.linalg.norm(w - float(np.dot(w, g)) * np.asarray(g, dtype=float)))
+
+
+def triangulate(centers, rays):
+    """Least-squares 3D point closest to a set of rays. None if degenerate (e.g. parallel rays)."""
+    A = np.zeros((3, 3))
+    b = np.zeros(3)
+    for C, g in zip(centers, rays):
+        Pperp = np.eye(3) - np.outer(g, g)
+        A += Pperp
+        b += Pperp @ C
+    try:
+        return np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        return None
+
+
 def frame_from_axis(a, up):
     """Connector frame as a 3x3 rotation (columns = x, y, z), in world coordinates.
 
@@ -144,10 +164,24 @@ class ConnectorPoseNode(Node):
         # Keep well more history than the worst-case detector latency.
         self.tf_cache_s = float(p("tf_cache_s", 60.0).value)
 
+        # ---- outlier rejection (RANSAC consensus across views) ----
+        # Background cables/connectors are REAL objects: they back-project to perfectly good rays, just
+        # rays to a DIFFERENT 3D point. Nothing in a single image can tell them from the target -- only
+        # agreement ACROSS views can. So we keep every candidate neck and take the point that the most
+        # VIEWS agree on. Scoring by DISTINCT VIEWS (not raw detections) means one frame full of
+        # spurious masks cannot outvote a genuine multi-view cluster.
+        self.ransac_iters = int(p("ransac_iters", 200).value)
+        self.inlier_dist = float(p("inlier_dist_m", 0.010).value)     # ray must pass within this of P
+        self.min_inlier_views = int(p("min_inlier_views", 3).value)   # "multiple consistent detections"
+        self.max_range = float(p("max_range_m", 0.80).value)          # 0 = off; rejects far background
+        self.ws_min = np.asarray(p("workspace_min", [-10.0, -10.0, -10.0]).value, dtype=float)
+        self.ws_max = np.asarray(p("workspace_max", [10.0, 10.0, 10.0]).value, dtype=float)
+
         self.K = None
         self.Kinv = None
-        self.history = deque(maxlen=self.max_history)   # dicts: p,d,C,R_wc
-        self.last_pixel = None
+        self.history = deque(maxlen=self.max_history)   # dicts: p,d,C,R_wc,g,n,view
+        self._view_id = 0
+        self._rng = np.random.default_rng()
 
         self.tf_buffer = Buffer(cache_time=Duration(seconds=self.tf_cache_s))
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -176,17 +210,6 @@ class ConnectorPoseNode(Node):
         if not msg.poses:
             return
 
-        # single-connector association: nearest pixel to the last accepted one
-        def pixel(pose):
-            return np.array([pose.position.x, pose.position.y])
-        if self.last_pixel is None:
-            pose = msg.poses[0]
-        else:
-            pose = min(msg.poses, key=lambda ps: np.linalg.norm(pixel(ps) - self.last_pixel))
-        u, v = pose.position.x, pose.position.y
-        yaw = 2.0 * math.atan2(pose.orientation.z, pose.orientation.w)  # pure-z quat
-        d = np.array([math.cos(yaw), math.sin(yaw)])                    # pixel-frame dir
-
         src = msg.header.frame_id or self.camera_frame_override
         if not src:
             self.get_logger().warn("Neck message has no frame_id and no camera_frame param set.")
@@ -206,56 +229,120 @@ class ConnectorPoseNode(Node):
 
         t = tf.transform.translation
         q = tf.transform.rotation
-        C = np.array([t.x, t.y, t.z])
+        C = np.array([t.x, t.y, t.z])                   # camera centre, shared by every neck in frame
         R_wc = quat_to_rotmat(q.x, q.y, q.z, q.w)
 
-        self.last_pixel = np.array([u, v])
-        self.history.append(dict(p=np.array([u, v]), d=d, C=C, R_wc=R_wc))
+        # Keep EVERY neck in this frame as a CANDIDATE -- do not try to pick "the right one" here.
+        # A background cable/connector looks exactly as valid as the target in a single image; only
+        # consensus across views separates them (see _ransac). The previous code kept just one neck per
+        # frame, chosen as "nearest pixel to the last accepted one" -- but the camera MOVES between
+        # views, so the target's pixel jumps, and that heuristic could latch onto a background object
+        # and then stay locked to it for the rest of the run.
+        self._view_id += 1
+        for pose in msg.poses:
+            u, v = float(pose.position.x), float(pose.position.y)
+            yaw = 2.0 * math.atan2(pose.orientation.z, pose.orientation.w)   # pure-z quat
+            d = np.array([math.cos(yaw), math.sin(yaw)])                     # pixel-frame direction
+
+            g = R_wc @ (self.Kinv @ np.array([u, v, 1.0]))                   # world ray through neck
+            g /= (np.linalg.norm(g) + 1e-12)
+            l = np.array([d[1], -d[0], d[0] * v - d[1] * u])                 # image line through p
+            n = R_wc @ (self.K.T @ l)                                        # its back-projected plane
+            n /= (np.linalg.norm(n) + 1e-12)
+
+            self.history.append(dict(p=np.array([u, v]), d=d, C=C, R_wc=R_wc,
+                                     g=g, n=n, view=self._view_id))
         self.estimate_and_publish(msg.header.stamp)
+
+    # ---------------------------------------------------------------- outlier rejection
+    def _in_workspace(self, P):
+        """Gate a candidate 3D point. Background clutter is typically FAR from the camera and/or
+        outside the working volume, so these two cheap tests kill most of it before RANSAC even
+        scores it."""
+        if self.max_range > 0.0 and not np.isfinite(P).all():
+            return False
+        return bool(np.all(P >= self.ws_min) and np.all(P <= self.ws_max))
+
+    def _ransac(self, obs):
+        """Largest set of observations consistent with ONE 3D point. Returns (P, inlier_indices).
+
+        Two observations from DIFFERENT views define a candidate point (rays sharing a camera centre
+        cannot triangulate). We score each candidate by the number of DISTINCT VIEWS among its inliers
+        -- not the raw detection count -- so a single frame full of spurious masks cannot outvote a
+        genuine cluster that several views agree on. That is exactly the "the true cable/connector has
+        multiple consistent detections" criterion."""
+        n = len(obs)
+        idx_by_view = {}
+        for k, o in enumerate(obs):
+            idx_by_view.setdefault(o["view"], []).append(k)
+        views = list(idx_by_view)
+        if len(views) < 2:
+            return None, []
+
+        best_P, best_in, best_score = None, [], 0
+        for _ in range(self.ransac_iters):
+            va, vb = self._rng.choice(len(views), size=2, replace=False)
+            ka = int(self._rng.choice(idx_by_view[views[va]]))
+            kb = int(self._rng.choice(idx_by_view[views[vb]]))
+            P = triangulate([obs[ka]["C"], obs[kb]["C"]], [obs[ka]["g"], obs[kb]["g"]])
+            if P is None or not self._in_workspace(P):
+                continue
+            if self.max_range > 0.0 and np.linalg.norm(P - obs[ka]["C"]) > self.max_range:
+                continue                                   # too far away to be the cable in the cell
+
+            inl = [k for k in range(n)
+                   if ray_point_distance(obs[k]["C"], obs[k]["g"], P) <= self.inlier_dist]
+            score = len({obs[k]["view"] for k in inl})     # DISTINCT VIEWS = the consensus criterion
+            if score > best_score or (score == best_score and len(inl) > len(best_in)):
+                best_P, best_in, best_score = P, inl, score
+        return best_P, best_in
 
     # ---------------------------------------------------------------- estimation
     def estimate_and_publish(self, stamp):
-        if len(self.history) < self.min_views:
-            self.get_logger().info(f"accumulating views: {len(self.history)}/{self.min_views}",
+        obs = list(self.history)
+        n_views_total = len({o["view"] for o in obs})
+        if n_views_total < self.min_views:
+            self.get_logger().info(f"accumulating views: {n_views_total}/{self.min_views}",
                                    throttle_duration_sec=2.0)
             return
 
-        rays, centers, normals, samples = [], [], [], []
-        for h in self.history:
-            u, v = h["p"]
-            r_cam = self.Kinv @ np.array([u, v, 1.0])
-            g = h["R_wc"] @ r_cam
-            g /= (np.linalg.norm(g) + 1e-12)
-            rays.append(g); centers.append(h["C"])
-            # back-projected image-line plane normal for the axis constraint
-            dx, dy = h["d"]
-            l = np.array([dy, -dx, dx * v - dy * u])           # image line through p along d
-            m_cam = self.K.T @ l
-            n = h["R_wc"] @ m_cam
-            n /= (np.linalg.norm(n) + 1e-12)
-            normals.append(n)
-            samples.append(h)
+        # --- OUTLIER REJECTION: keep only the detections that agree on one 3D point ---
+        P, inl = self._ransac(obs)
+        if P is None or not inl:
+            self.get_logger().warn(
+                f"no 3D point is consistent across views ({len(obs)} detection(s) in "
+                f"{n_views_total} view(s) all disagree) -- nothing published.",
+                throttle_duration_sec=2.0)
+            return
+
+        n_in_views = len({obs[k]["view"] for k in inl})
+        if n_in_views < self.min_inlier_views:
+            self.get_logger().info(
+                f"best cluster spans only {n_in_views}/{n_views_total} view(s), need "
+                f"{self.min_inlier_views} -- not yet trustworthy. ({len(obs) - len(inl)} detection(s) "
+                "rejected as background/outliers.)", throttle_duration_sec=2.0)
+            return
+
+        samples = [obs[k] for k in inl]                      # <-- everything below uses INLIERS ONLY
+        rays = [o["g"] for o in samples]
+        centers = [o["C"] for o in samples]
+        normals = [o["n"] for o in samples]
+        n_rejected = len(obs) - len(inl)
 
         # parallax gate: need spread in ray directions to triangulate a point
-        G = np.array(rays)
         max_ang = 0.0
-        for i in range(len(G)):
-            for j in range(i + 1, len(G)):
-                c = np.clip(G[i] @ G[j], -1, 1)
+        for i in range(len(rays)):
+            for j in range(i + 1, len(rays)):
+                c = np.clip(rays[i] @ rays[j], -1, 1)
                 max_ang = max(max_ang, math.degrees(math.acos(c)))
         if max_ang < self.min_parallax_deg:
             self.get_logger().info(f"insufficient parallax ({max_ang:.1f} deg); moving the camera "
                                    f"more will improve the estimate.", throttle_duration_sec=2.0)
             return
 
-        # --- origin: least-squares closest point to all rays ---
-        A = np.zeros((3, 3)); b = np.zeros(3)
-        for g, C in zip(rays, centers):
-            Pperp = np.eye(3) - np.outer(g, g)
-            A += Pperp; b += Pperp @ C
-        try:
-            P = np.linalg.solve(A, b)
-        except np.linalg.LinAlgError:
+        # --- origin: refit on the inliers (least-squares closest point to their rays) ---
+        P = triangulate(centers, rays)
+        if P is None:
             self.get_logger().warn("degenerate triangulation.", throttle_duration_sec=2.0)
             return
 
@@ -317,7 +404,9 @@ class ConnectorPoseNode(Node):
 
         self.get_logger().info(
             f"connector pose | P=({P[0]:.3f},{P[1]:.3f},{P[2]:.3f}) "
-            f"axis=({a[0]:+.2f},{a[1]:+.2f},{a[2]:+.2f}) views={len(self.history)} "
+            f"axis=({a[0]:+.2f},{a[1]:+.2f},{a[2]:+.2f}) "
+            f"inliers={len(inl)}/{len(obs)} across {n_in_views}/{n_views_total} views "
+            f"(rejected {n_rejected} as background) "
             f"parallax={max_ang:.1f}deg depth={depth:.2f}m exp_neck_r={exp_r:.1f}px")
 
 
