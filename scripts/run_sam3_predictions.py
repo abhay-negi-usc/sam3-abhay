@@ -17,19 +17,26 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass  # HEIC/HEIF support unavailable; install `pillow-heif` to enable it.
+
 from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
 CONFIG = {
-    "prompt": "cable",
-    "image_dir": "cable_test_images",
-    "threshold": 0.5,
+    "prompt": "receptacle",
+    "image_dir": "/home/rp/abhay_ws/sam3-abhay/data/socket_test_images/",
+    "threshold": 0.10,
     # rendering
     "alpha": 0.5,
     "color": (46, 204, 113),
 }
 
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".heic", ".heif")
 
 
 def _font(size):
